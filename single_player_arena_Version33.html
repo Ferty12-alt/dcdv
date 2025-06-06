@@ -1,0 +1,1358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Single Player Arena</title>
+  <style>
+    body { background: #222; text-align: center; }
+    canvas { background: #eee; display: block; margin: 30px auto; border: 2px solid #333; }
+    h1 { color: white; }
+    #info { color: #fff; font-size: 1.1em; }
+    #commandPrompt {
+      display: none;
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: 30px;
+      width: 700px;
+      background: rgba(0,0,0,0.7);
+      border: 2px solid #bbb;
+      border-radius: 10px;
+      z-index: 10;
+      padding: 14px;
+      box-shadow: 0 0 12px #000a;
+    }
+    #commandPrompt input {
+      background: rgba(255,255,255,0.12);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 20px;
+      width: 95%;
+      padding: 7px 12px;
+      outline: none;
+      font-family: monospace;
+    }
+    #commandPrompt label {
+      color: #ddd;
+      font-family: monospace;
+      font-size: 16px;
+      display: block;
+      margin-bottom: 4px;
+      text-align: left;
+    }
+  </style>
+</head>
+<body>
+  <h1>Single Player Arena</h1>
+  <div id="info">
+    Move: <strong>WASD</strong> &nbsp;|&nbsp; Shoot <strong>F</strong> (arrow direction)<br>
+    Change facing: <strong>Q</strong> (left), <strong>E</strong> (right), <strong>R</strong> (up), <strong>C</strong> (down)<br>
+    Switch weapon: <strong>1</strong>=Default, <strong>2</strong>=Shotgun, <strong>3</strong>=Burst.<br>
+    Place block: <strong>Space</strong> (arrow direction, stacks across waves)<br>
+    Shotgun: triple barrel, fires once, then reloads.<br>
+    <strong>Wave 5+: Grug boss appears (green, huge, breaks blocks, shotgun is very strong)!</strong><br>
+    <strong>Wave 100, 200, 300, 400, 500: Bobby appears (magenta triangle, 1000 health, shoots triangle projectiles in all directions from his body, explodes blocks with magenta beams)!</strong><br>
+    <strong>Wave 500: The Ultimate Beam Gun spawns only in front of you, pick it up to use it ONLY against Bobby!</strong><br>
+    <strong>Tab</strong>: open command prompt (bottom). Try <kbd>/waveskip 7</kbd> or <kbd>/hearts 20</kbd>.<br>
+    Defeat all the red enemies, Grug, and Bobby!
+  </div>
+  <canvas id="game" width="1400" height="700"></canvas>
+  <div id="commandPrompt">
+    <label for="cmdinput">Command (Tab to focus, Enter to run, Esc to close):</label>
+    <input id="cmdinput" type="text" autocomplete="off" spellcheck="false" />
+  </div>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const PLAYER_START_HEALTH = 5;
+const BLOCK_SIZE = 40;
+const PLAYER_SIZE = 32;
+const BOSS_SIZE = PLAYER_SIZE * 2.5;
+const BOBBY_SIZE = PLAYER_SIZE * 3.5;
+const SPEED = 4;
+const ENEMY_SPEED = 2.2;
+const BOSS_SPEED = 1.7;
+const PROJECTILE_SPEED = 8;
+const PROJECTILE_SIZE = 8;
+const PROJECTILE_SPREAD = Math.PI / 12;
+const ENEMY_HEALTH = 3;
+const BOSS_HEALTH = 24;
+const BOBBY_HEALTH = 1000;
+const WEAPON_DEFAULT = 'default';
+const WEAPON_SHOTGUN = 'shotgun';
+const WEAPON_BURST = 'burst';
+const WEAPON_BEAM = 'beam';
+const BURST_COUNT = 3;
+const BURST_INTERVAL = 4;
+const BLOCKS_PER_WAVE = 3;
+const FIRE_LIMIT = 3;
+const OVERHEAT_COOLDOWN = 180;
+const SHOTGUN_RELOAD = 60;
+let shotgunNeedsReload = false;
+let shotgunReloadTimer = 0;
+const PROJECTILE_DAMAGE = {
+  default: 0.5,
+  shotgun: 0.5,
+  burst: 0.5,
+  enemy: 1,
+  bobby: 2 // Bobby's triangles do 2 damage
+};
+const SHOTGUN_BOSS_MULTIPLIER = 2.5;
+const BOBBY_BEAMS_COUNT = 8;
+const BOBBY_BEAM_COLOR = "#ff33d9";
+const BOBBY_BEAM_WIDTH = 11;
+const BOBBY_BEAM_LENGTH = 180;
+const BOBBY_BEAM_FREQUENCY = 90; // frames between beam attacks
+
+// BEAM GUN CONSTANTS
+const BEAM_GUN_DAMAGE = 15;
+const BEAM_GUN_DAMAGE_INTERVAL = 90; // 1.5 seconds at 60fps
+const BEAM_GUN_DURATION = 1200; // 20 seconds at 60fps
+const BEAM_GUN_COOLDOWN = 180; // 3 seconds at 60fps
+
+let beamGunSpawned = false;
+let beamGunPicked = false;
+let beamGunPos = null;
+let beamGunActive = false;
+let beamGunTimer = 0;
+let beamGunCooldown = 0;
+let beamGunDamageTimer = 0;
+
+let keys = {};
+let placeBlockKeyWasDown = false;
+let lastMoveDir = {x:1, y:0};
+let player, enemies, enemyProjectiles, projectiles, blocks, wave, gameOver, winnerText, burstState, boss, bobby;
+let paused = false;
+let commandActive = false;
+const cmdPrompt = document.getElementById('commandPrompt');
+const cmdInput = document.getElementById('cmdinput');
+
+function getMaxHealth(wave) {
+  return PLAYER_START_HEALTH + 0.5 * (wave - 1);
+}
+
+function resetPlayerAndGameVars() {
+  player = {
+    x: 100, y: 350, color: 'blue',
+    maxHealth: getMaxHealth(1),
+    health: getMaxHealth(1),
+    cooldown: 0,
+    weapon: WEAPON_DEFAULT,
+    unlocked: [WEAPON_DEFAULT, WEAPON_SHOTGUN, WEAPON_BURST],
+    blocksAvailable: BLOCKS_PER_WAVE,
+    fireCount: 0,
+    overheat: 0,
+    facing: 'right'
+  };
+  enemies = [];
+  enemyProjectiles = [];
+  projectiles = [];
+  blocks = [];
+  boss = null;
+  bobby = null;
+  wave = 1;
+  gameOver = false;
+  winnerText = "";
+  burstState = { active: false, dir: null, shotsLeft: 0, timer: 0 };
+  lastMoveDir = {x:1, y:0};
+  shotgunNeedsReload = false;
+  shotgunReloadTimer = 0;
+  paused = false;
+  beamGunSpawned = false;
+  beamGunPicked = false;
+  beamGunActive = false;
+  beamGunPos = null;
+  beamGunTimer = 0;
+  beamGunCooldown = 0;
+  beamGunDamageTimer = 0;
+}
+
+function unlockWeaponsForWave() {
+  player.unlocked = [WEAPON_DEFAULT, WEAPON_SHOTGUN, WEAPON_BURST];
+  if (!player.unlocked.includes(player.weapon)) player.weapon = WEAPON_DEFAULT;
+}
+
+// Bobby's triangle projectile logic
+function fireBobbyProjectiles() {
+  if (!bobby || bobby.health <= 0) return;
+  // Fire 16 triangle projectiles in all directions from Bobby's center
+  let centerX = bobby.x + BOBBY_SIZE/2;
+  let centerY = bobby.y + BOBBY_SIZE/2;
+  let n = 16;
+  for (let i = 0; i < n; i++) {
+    let angle = (2 * Math.PI / n) * i;
+    let speed = 7.5;
+    let dx = speed * Math.cos(angle);
+    let dy = speed * Math.sin(angle);
+    let px = centerX + Math.cos(angle) * (BOBBY_SIZE/2.1);
+    let py = centerY + Math.sin(angle) * (BOBBY_SIZE/2.1);
+    enemyProjectiles.push({
+      x: px - PROJECTILE_SIZE/2, y: py - PROJECTILE_SIZE/2,
+      dx, dy,
+      color: "#ff33d9",
+      owner: "bobby",
+      damage: PROJECTILE_DAMAGE.bobby,
+      isTriangle: true,
+      triangleAngle: angle
+    });
+  }
+}
+
+// Bobby's beams logic
+let bobbyFireTimer = 0;
+let bobbyBeamTimer = 0;
+let bobbyBeams = []; // array of { angle, frame, visible }
+
+function fireBobbyBeams() {
+  if (!bobby || bobby.health <= 0) return;
+  let centerX = bobby.x + BOBBY_SIZE/2;
+  let centerY = bobby.y + BOBBY_SIZE/2;
+  let count = BOBBY_BEAMS_COUNT;
+  bobbyBeams = [];
+  for (let i = 0; i < count; i++) {
+    let angle = (2 * Math.PI / count) * i;
+    bobbyBeams.push({angle, frame: 0, visible: true});
+  }
+  // Instantly destroy any block in the beam's path, visual beam lingers for a few frames
+  for (let i = 0; i < count; i++) {
+    let angle = bobbyBeams[i].angle;
+    let dx = Math.cos(angle);
+    let dy = Math.sin(angle);
+    for (let dist = 32; dist < BOBBY_BEAM_LENGTH; dist += BLOCK_SIZE/2) {
+      let bx = centerX + dx * dist;
+      let by = centerY + dy * dist;
+      for (let j = blocks.length-1; j >= 0; j--) {
+        let block = blocks[j];
+        if (rectsCollide({x: bx-5, y: by-5}, 10, 10, block, BLOCK_SIZE, BLOCK_SIZE)) {
+          blocks.splice(j, 1);
+        }
+      }
+    }
+  }
+}
+
+// Enemy Spawning
+function spawnEnemies() {
+  enemies = [];
+  // Only 500 waves max
+  if (wave > 500) {
+    gameOver = true;
+    winnerText = "YOU WIN!";
+    return;
+  }
+  // Bobby (waves 100, 200, 300, 400, 500)
+  if ([100, 200, 300, 400, 500].includes(wave)) {
+    bobby = {
+      name: "Bobby",
+      x: 1100,
+      y: canvas.height/2 - BOBBY_SIZE/2,
+      color: "#ff33d9",
+      health: BOBBY_HEALTH,
+      maxHealth: BOBBY_HEALTH,
+      speed: 1.2,
+      isBobby: true,
+      breakBlockTimer: 0
+    };
+    bobbyFireTimer = 60;
+    bobbyBeamTimer = BOBBY_BEAM_FREQUENCY;
+    bobbyBeams = [];
+  } else {
+    bobby = null;
+    bobbyFireTimer = 0;
+    bobbyBeamTimer = 0;
+    bobbyBeams = [];
+  }
+  // Grug boss
+  if (wave >= 5 && ![100,200,300,400,500].includes(wave)) {
+    boss = {
+      name: "Grug",
+      x: 1100,
+      y: canvas.height/2 - BOSS_SIZE/2,
+      color: "#27ac2c",
+      health: BOSS_HEALTH + (wave-5)*6,
+      maxHealth: BOSS_HEALTH + (wave-5)*6,
+      cooldown: 0,
+      id: 9001,
+      isBoss: true,
+      speed: BOSS_SPEED,
+      breakBlockTimer: 0
+    };
+  } else {
+    boss = null;
+  }
+  // Enemies (not during Bobby)
+  if (![100,200,300,400,500].includes(wave)) {
+    for (let i = 0; i < wave; i++) {
+      let ex = 1100 + Math.random()*200, ey = 80 + Math.random()*(canvas.height-200);
+      enemies.push({
+        x: ex, y: ey, color: 'red', health: ENEMY_HEALTH,
+        cooldown: 0,
+        weapon: WEAPON_DEFAULT,
+        id: i,
+        path: [],
+        fireCount: 0,
+        overheat: 0
+      });
+    }
+  }
+  // Reset beam gun spawn for Bobby on wave 500
+  if (wave === 500) {
+    // Gun spawns in front of player
+    let px = player.x + PLAYER_SIZE/2 + 60;
+    let py = player.y + PLAYER_SIZE/2 - 14;
+    beamGunSpawned = true;
+    beamGunPicked = false;
+    beamGunActive = false;
+    beamGunPos = {x: px, y: py};
+    player.weapon = WEAPON_DEFAULT;
+  } else {
+    beamGunSpawned = false;
+    beamGunPicked = false;
+    beamGunActive = false;
+    beamGunPos = null;
+  }
+  beamGunTimer = 0;
+  beamGunCooldown = 0;
+  beamGunDamageTimer = 0;
+}
+
+// Controls
+document.addEventListener('keydown', e => {
+  if (e.key === "Tab") {
+    e.preventDefault();
+    if (!commandActive) {
+      commandActive = true;
+      paused = true;
+      cmdPrompt.style.display = "block";
+      cmdInput.value = "";
+      setTimeout(() => { cmdInput.focus(); }, 10);
+    } else {
+      cmdInput.focus();
+    }
+    return;
+  }
+  if (commandActive) {
+    if (e.key === "Escape") {
+      cmdPrompt.style.display = "none";
+      commandActive = false;
+      paused = false;
+      canvas.focus();
+      return;
+    }
+    if (e.key === "Enter") {
+      handleCommand(cmdInput.value.trim());
+      return;
+    }
+    return;
+  }
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (key === ' ' || e.code === "Space") {
+    e.preventDefault();
+    if (!keys['placeblock']) {
+      keys['placeblock'] = true;
+    }
+  } else {
+    keys[key] = true;
+  }
+  if (key === '1' && player.weapon !== WEAPON_BEAM) player.weapon = WEAPON_DEFAULT;
+  if (key === '2' && player.weapon !== WEAPON_BEAM) player.weapon = WEAPON_SHOTGUN;
+  if (key === '3' && player.weapon !== WEAPON_BEAM) player.weapon = WEAPON_BURST;
+  if (key === 'q') player.facing = 'left';
+  if (key === 'e') player.facing = 'right';
+  if (key === 'r') player.facing = 'up';
+  if (key === 'c') player.facing = 'down';
+  if (gameOver && (key === ' ' || e.code === "Space")) {
+    resetGame();
+  }
+});
+document.addEventListener('keyup', e => {
+  if (commandActive) return;
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (key === ' ' || e.code === "Space") {
+    keys['placeblock'] = false;
+  } else {
+    keys[key] = false;
+  }
+});
+
+function handleCommand(cmd) {
+  if (!cmd) return;
+  if (cmd.startsWith("/waveskip")) {
+    let num = parseInt(cmd.replace("/waveskip","").trim());
+    if (!isNaN(num) && num >= 1 && num <= 500) {
+      wave = num;
+      unlockWeaponsForWave();
+      spawnEnemies();
+      player.maxHealth = getMaxHealth(wave);
+      player.health = player.maxHealth;
+      player.blocksAvailable += BLOCKS_PER_WAVE;
+      player.fireCount = 0;
+      player.overheat = 0;
+      shotgunNeedsReload = false;
+      shotgunReloadTimer = 0;
+      winnerText = "";
+      gameOver = false;
+      burstState = { active: false, dir: null, shotsLeft: 0, timer: 0 };
+      commandActive = false;
+      paused = false;
+      cmdPrompt.style.display = "none";
+      canvas.focus();
+    } else {
+      cmdInput.value = "/waveskip [1-500]";
+    }
+  } else if (cmd.startsWith("/hearts")) {
+    let num = parseFloat(cmd.replace("/hearts","").trim());
+    if (!isNaN(num) && num > 0) {
+      player.maxHealth = num;
+      player.health = num;
+      commandActive = false;
+      paused = false;
+      cmdPrompt.style.display = "none";
+      canvas.focus();
+    } else {
+      cmdInput.value = "/hearts [number]";
+    }
+  } else {
+    cmdInput.value = "Unknown command";
+  }
+}
+
+function tryPlaceBlock() {
+  if (keys['placeblock'] && !placeBlockKeyWasDown && player.blocksAvailable > 0 && !gameOver) {
+    let dir = {x:0, y:0};
+    if (player.facing === 'left') dir = {x:-1, y:0};
+    if (player.facing === 'right') dir = {x:1, y:0};
+    if (player.facing === 'up') dir = {x:0, y:-1};
+    if (player.facing === 'down') dir = {x:0, y:1};
+    let centerX = player.x + PLAYER_SIZE/2;
+    let centerY = player.y + PLAYER_SIZE/2;
+    let bx = Math.round((centerX + dir.x * BLOCK_SIZE - BLOCK_SIZE/2) / BLOCK_SIZE) * BLOCK_SIZE;
+    let by = Math.round((centerY + dir.y * BLOCK_SIZE - BLOCK_SIZE/2) / BLOCK_SIZE) * BLOCK_SIZE;
+    if (
+      !rectsCollide({x: bx, y: by}, BLOCK_SIZE, BLOCK_SIZE, player, PLAYER_SIZE, PLAYER_SIZE) &&
+      bx >= 0 && bx + BLOCK_SIZE <= canvas.width &&
+      by >= 0 && by + BLOCK_SIZE <= canvas.height &&
+      canPlaceBlockHere(bx, by)
+    ) {
+      blocks.push({x: bx, y: by});
+      player.blocksAvailable--;
+    }
+  }
+  placeBlockKeyWasDown = keys['placeblock'];
+}
+
+function canPlaceBlockHere(x, y) {
+  for (const block of blocks) {
+    if (rectsCollide({x, y}, BLOCK_SIZE, BLOCK_SIZE, block, BLOCK_SIZE, BLOCK_SIZE))
+      return false;
+  }
+  if (boss && rectsCollide({x, y}, BLOCK_SIZE, BLOCK_SIZE, boss, BOSS_SIZE, BOSS_SIZE))
+    return false;
+  if (bobby && rectsCollide({x, y}, BLOCK_SIZE, BLOCK_SIZE, bobby, BOBBY_SIZE, BOBBY_SIZE))
+    return false;
+  for (const e of enemies) {
+    if (rectsCollide({x, y}, BLOCK_SIZE, BLOCK_SIZE, e, PLAYER_SIZE, PLAYER_SIZE))
+      return false;
+  }
+  return true;
+}
+
+// Special: Beam Gun Weapon
+function updateBeamGunPickup() {
+  if (
+    beamGunSpawned && beamGunPos && !beamGunPicked &&
+    rectsCollide(
+      {x: player.x + PLAYER_SIZE / 2 - 12, y: player.y + PLAYER_SIZE / 2 - 8},
+      24, 16,
+      beamGunPos, 32, 24
+    )
+  ) {
+    beamGunPicked = true;
+    beamGunActive = false;
+    player.weapon = WEAPON_BEAM;
+    player.unlocked = [WEAPON_BEAM]; // Only beam gun available!
+    beamGunSpawned = false;
+    beamGunPos = null;
+    beamGunTimer = 0;
+    beamGunCooldown = 0;
+    beamGunDamageTimer = 0;
+  }
+}
+
+// Beam Gun Firing
+function updateBeamGunAttack() {
+  if (player.weapon !== WEAPON_BEAM || !beamGunPicked || !bobby || bobby.health <= 0) return;
+  // Start firing when F is held and not cooling down, or auto-fire if already firing
+  if (beamGunActive ||
+    (
+      keys['f'] && beamGunCooldown <= 0 && !beamGunActive && beamGunTimer <= 0
+    )
+  ) {
+    beamGunActive = true;
+    beamGunTimer++;
+    // Do damage to Bobby every interval
+    beamGunDamageTimer++;
+    if (beamGunDamageTimer >= BEAM_GUN_DAMAGE_INTERVAL) {
+      if (rectsCollide(
+        {x: player.x + PLAYER_SIZE/2, y: player.y + PLAYER_SIZE/2}, 1, 1,
+        {x: bobby.x, y: bobby.y}, BOBBY_SIZE, BOBBY_SIZE
+      )) {
+        // If player overlap bobby center, avoid instant kill, just do damage always
+        bobby.health -= BEAM_GUN_DAMAGE;
+      } else {
+        bobby.health -= BEAM_GUN_DAMAGE;
+      }
+      if (bobby.health < 0) bobby.health = 0;
+      beamGunDamageTimer = 0;
+    }
+    // Stop after 20s, cooldown for 3s
+    if (beamGunTimer >= BEAM_GUN_DURATION) {
+      beamGunActive = false;
+      beamGunCooldown = BEAM_GUN_COOLDOWN;
+      beamGunTimer = 0;
+      beamGunDamageTimer = 0;
+    }
+  } else if (beamGunCooldown > 0) {
+    beamGunCooldown--;
+    beamGunActive = false;
+    beamGunTimer = 0;
+    beamGunDamageTimer = 0;
+  }
+}
+
+function shootProjectiles(shooter, idx, direction, isPlayer) {
+  // Do nothing if beam gun
+  if (isPlayer && player.weapon === WEAPON_BEAM) return;
+  let dx = 0, dy = 0;
+  if (direction === 'right') dx = PROJECTILE_SPEED;
+  if (direction === 'left') dx = -PROJECTILE_SPEED;
+  if (direction === 'up') dy = -PROJECTILE_SPEED;
+  if (direction === 'down') dy = PROJECTILE_SPEED;
+  if (isPlayer && shooter.weapon === WEAPON_SHOTGUN) {
+    if (shotgunNeedsReload) return;
+    let spreadAngles;
+    if (direction === 'right') spreadAngles = [0, -PROJECTILE_SPREAD, PROJECTILE_SPREAD];
+    else if (direction === 'left') spreadAngles = [Math.PI, Math.PI - PROJECTILE_SPREAD, Math.PI + PROJECTILE_SPREAD];
+    else if (direction === 'up') spreadAngles = [-Math.PI/2, -Math.PI/2 - PROJECTILE_SPREAD, -Math.PI/2 + PROJECTILE_SPREAD];
+    else if (direction === 'down') spreadAngles = [Math.PI/2, Math.PI/2 - PROJECTILE_SPREAD, Math.PI/2 + PROJECTILE_SPREAD];
+    for (let angle of spreadAngles) {
+      let speedX = PROJECTILE_SPEED * Math.cos(angle);
+      let speedY = PROJECTILE_SPEED * Math.sin(angle);
+      projectiles.push({
+        x: shooter.x + PLAYER_SIZE/2 - PROJECTILE_SIZE/2,
+        y: shooter.y + PLAYER_SIZE/2 - PROJECTILE_SIZE/2,
+        dx: speedX,
+        dy: speedY,
+        color: shooter.color, owner: idx,
+        damage: PROJECTILE_DAMAGE.shotgun,
+        isShotgun: true
+      });
+    }
+    shotgunNeedsReload = true;
+    shotgunReloadTimer = SHOTGUN_RELOAD;
+    return;
+  }
+  if (isPlayer && shooter.weapon === WEAPON_BURST) {
+    if (!burstState.active) {
+      burstState.active = true;
+      burstState.dir = direction;
+      burstState.shotsLeft = BURST_COUNT;
+      burstState.timer = 0;
+    }
+    return;
+  }
+  let dest = isPlayer ? projectiles : enemyProjectiles;
+  dest.push({
+    x: shooter.x + PLAYER_SIZE/2 - PROJECTILE_SIZE/2,
+    y: shooter.y + PLAYER_SIZE/2 - PROJECTILE_SIZE/2,
+    dx: dx,
+    dy: dy,
+    color: shooter.color,
+    owner: idx,
+    damage: isPlayer
+      ? (shooter.weapon === WEAPON_DEFAULT ? PROJECTILE_DAMAGE.default : PROJECTILE_DAMAGE.burst)
+      : PROJECTILE_DAMAGE.enemy,
+    isShotgun: false
+  });
+}
+
+function doBurstFire() {
+  if (!burstState.active) return;
+  if (burstState.shotsLeft > 0 && burstState.timer <= 0) {
+    let direction = burstState.dir;
+    let dx = 0, dy = 0;
+    if (direction === 'right') dx = PROJECTILE_SPEED;
+    if (direction === 'left') dx = -PROJECTILE_SPEED;
+    if (direction === 'up') dy = -PROJECTILE_SPEED;
+    if (direction === 'down') dy = PROJECTILE_SPEED;
+    projectiles.push({
+      x: player.x + PLAYER_SIZE/2 - PROJECTILE_SIZE/2,
+      y: player.y + PLAYER_SIZE/2 - PROJECTILE_SIZE/2,
+      dx: dx,
+      dy: dy,
+      color: player.color, owner: 0,
+      damage: PROJECTILE_DAMAGE.burst,
+      isShotgun: false
+    });
+    burstState.shotsLeft--;
+    burstState.timer = BURST_INTERVAL;
+  }
+  burstState.timer--;
+  if (burstState.shotsLeft <= 0) {
+    burstState.active = false;
+    player.cooldown = 16;
+  }
+}
+
+function tryMove(obj, dx, dy, size = PLAYER_SIZE) {
+  let newX = obj.x + dx;
+  let collidedX = false;
+  for (const block of blocks) {
+    if (rectsCollide({x: newX, y: obj.y}, size, size, block, BLOCK_SIZE, BLOCK_SIZE)) {
+      collidedX = true;
+      break;
+    }
+  }
+  if (!collidedX && newX >= 0 && newX <= canvas.width - size) {
+    obj.x = newX;
+  }
+  let newY = obj.y + dy;
+  let collidedY = false;
+  for (const block of blocks) {
+    if (rectsCollide({x: obj.x, y: newY}, size, size, block, BLOCK_SIZE, BLOCK_SIZE)) {
+      collidedY = true;
+      break;
+    }
+  }
+  if (!collidedY && newY >= 0 && newY <= canvas.height - size) {
+    obj.y = newY;
+  }
+}
+
+function movePlayer() {
+  let dx = 0, dy = 0;
+  if (keys['w']) { dy -= SPEED; lastMoveDir = {x:0, y:-1}; player.facing = 'up'; }
+  if (keys['s']) { dy += SPEED; lastMoveDir = {x:0, y:1}; player.facing = 'down'; }
+  if (keys['a']) { dx -= SPEED; lastMoveDir = {x:-1, y:0}; player.facing = 'left'; }
+  if (keys['d']) { dx += SPEED; lastMoveDir = {x:1, y:0}; player.facing = 'right'; }
+  tryMove(player, dx, dy, PLAYER_SIZE);
+  if (player.weapon === WEAPON_SHOTGUN && shotgunNeedsReload) {
+    shotgunReloadTimer--;
+    if (shotgunReloadTimer <= 0) {
+      shotgunNeedsReload = false;
+    }
+  }
+  if (player.weapon !== WEAPON_SHOTGUN) {
+    if (player.overheat > 0) {
+      player.overheat--;
+      if (player.overheat === 0) player.fireCount = 0;
+    }
+  }
+  if (player.weapon !== WEAPON_BEAM && player.cooldown <= 0 && !burstState.active && !gameOver) {
+    if (keys['f']) {
+      if (player.weapon === WEAPON_SHOTGUN) {
+        if (!shotgunNeedsReload) {
+          shootProjectiles(player, 0, player.facing, true);
+          player.cooldown = 16;
+        }
+      } else {
+        if (player.overheat === 0 && player.fireCount < FIRE_LIMIT) {
+          shootProjectiles(player, 0, player.facing, true);
+          player.cooldown = (player.weapon === WEAPON_BURST ? 4 : 20);
+          player.fireCount++;
+          if (player.fireCount >= FIRE_LIMIT) {
+            player.overheat = OVERHEAT_COOLDOWN;
+          }
+        }
+      }
+    }
+  }
+  if (player.cooldown > 0) player.cooldown--;
+  if (burstState.active) doBurstFire();
+}
+
+function moveBossLikeCube(obj, size, speed) {
+  if (!obj) return;
+  let dx = player.x + PLAYER_SIZE/2 - (obj.x + size/2);
+  let dy = player.y + PLAYER_SIZE/2 - (obj.y + size/2);
+  let dist = Math.sqrt(dx*dx + dy*dy);
+  if (dist > 2) {
+    let moveX = speed * dx / dist;
+    let moveY = speed * dy / dist;
+    let nextX = obj.x + moveX;
+    let nextY = obj.y + moveY;
+    let collidedBlock = null;
+    for (const block of blocks) {
+      if (rectsCollide({x: nextX, y: obj.y}, size, size, block, BLOCK_SIZE, BLOCK_SIZE)) {
+        collidedBlock = block;
+        break;
+      }
+    }
+    if (!collidedBlock) obj.x = nextX;
+    collidedBlock = null;
+    for (const block of blocks) {
+      if (rectsCollide({x: obj.x, y: nextY}, size, size, block, BLOCK_SIZE, BLOCK_SIZE)) {
+        collidedBlock = block;
+        break;
+      }
+    }
+    if (!collidedBlock) obj.y = nextY;
+  }
+  if (!obj.breakBlockTimer || obj.breakBlockTimer <= 0) {
+    for (let i = 0; i < blocks.length; ++i) {
+      if (rectsCollide(obj, size, size, blocks[i], BLOCK_SIZE, BLOCK_SIZE)) {
+        blocks.splice(i, 1);
+        obj.breakBlockTimer = 10;
+        break;
+      }
+    }
+  } else {
+    obj.breakBlockTimer--;
+  }
+}
+
+function moveBobby() {
+  if (!bobby) return;
+  moveBossLikeCube(bobby, BOBBY_SIZE, bobby.speed);
+  // Firing triangle projectiles in all directions
+  if (bobbyFireTimer <= 0) {
+    fireBobbyProjectiles();
+    bobbyFireTimer = 75;
+  } else {
+    bobbyFireTimer--;
+  }
+  // Beams: explode blocks in all directions every BOBBY_BEAM_FREQUENCY frames
+  if (bobbyBeamTimer <= 0) {
+    fireBobbyBeams();
+    bobbyBeamTimer = BOBBY_BEAM_FREQUENCY;
+  } else {
+    bobbyBeamTimer--;
+  }
+  // Reduce beam visibility timer
+  for (let i = 0; i < bobbyBeams.length; i++) {
+    bobbyBeams[i].frame++;
+    if (bobbyBeams[i].frame > 20) bobbyBeams[i].visible = false;
+  }
+}
+
+function moveBoss() {
+  if (!boss) return;
+  moveBossLikeCube(boss, BOSS_SIZE, boss.speed);
+}
+
+function gridPos(x, y) {
+  return {
+    gx: Math.floor((x + PLAYER_SIZE/2) / BLOCK_SIZE),
+    gy: Math.floor((y + PLAYER_SIZE/2) / BLOCK_SIZE)
+  };
+}
+function isGridBlocked(gx, gy) {
+  let x = gx * BLOCK_SIZE, y = gy * BLOCK_SIZE;
+  for (const block of blocks) {
+    if (rectsCollide({x, y}, BLOCK_SIZE, BLOCK_SIZE, block, BLOCK_SIZE, BLOCK_SIZE)) return true;
+  }
+  return false;
+}
+function getNeighbors(node, maxGX, maxGY) {
+  let dirs = [
+    {dx: 1, dy: 0}, {dx: -1, dy: 0}, {dx: 0, dy: 1}, {dx: 0, dy: -1}
+  ];
+  let result = [];
+  for (let d of dirs) {
+    let nx = node.x + d.dx, ny = node.y + d.dy;
+    if (nx < 0 || ny < 0 || nx > maxGX || ny > maxGY) continue;
+    if (!isGridBlocked(nx, ny)) result.push({x: nx, y: ny});
+  }
+  return result;
+}
+function gridHeuristic(a, b) {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+function aStar(start, goal, maxGX, maxGY) {
+  let open = [], closed = {};
+  open.push({x: start.x, y: start.y, g: 0, f: gridHeuristic(start, goal), parent: null});
+  let key = (n) => n.x + "," + n.y;
+  while (open.length > 0) {
+    open.sort((a, b) => a.f - b.f);
+    let curr = open.shift();
+    if (curr.x === goal.x && curr.y === goal.y) {
+      let path = [];
+      while (curr.parent) {
+        path.push({x: curr.x, y: curr.y});
+        curr = curr.parent;
+      }
+      path.reverse();
+      return path;
+    }
+    closed[key(curr)] = true;
+    for (let n of getNeighbors(curr, maxGX, maxGY)) {
+      if (closed[key(n)]) continue;
+      let g = curr.g + 1, f = g + gridHeuristic(n, goal);
+      let existing = open.find(o => o.x === n.x && o.y === n.y);
+      if (!existing || g < existing.g) {
+        open.push({x: n.x, y: n.y, g, f, parent: curr});
+      }
+    }
+  }
+  return [];
+}
+
+function moveEnemy(enemy, idx) {
+  if (enemy.overheat > 0) {
+    enemy.overheat--;
+    if (enemy.overheat === 0) enemy.fireCount = 0;
+  }
+  let gridW = Math.floor(canvas.width / BLOCK_SIZE);
+  let gridH = Math.floor(canvas.height / BLOCK_SIZE);
+  let start = gridPos(enemy.x, enemy.y);
+  let goal = gridPos(player.x, player.y);
+  if (!enemy.path || enemy.path.length === 0 ||
+      !enemy.lastGoal || enemy.lastGoal.x !== goal.gx || enemy.lastGoal.y !== goal.gy ||
+      Math.random() < 0.05
+  ) {
+    enemy.path = aStar({x: start.gx, y: start.gy}, {x: goal.gx, y: goal.gy}, gridW, gridH);
+    enemy.lastGoal = {x: goal.gx, y: goal.gy};
+  }
+  if (enemy.path && enemy.path.length > 0) {
+    let next = enemy.path[0];
+    let nextPx = next.x * BLOCK_SIZE + BLOCK_SIZE/2 - PLAYER_SIZE/2;
+    let nextPy = next.y * BLOCK_SIZE + BLOCK_SIZE/2 - PLAYER_SIZE/2;
+    let dx = nextPx - enemy.x, dy = nextPy - enemy.y;
+    let dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > 0.5) {
+      let moveX = ENEMY_SPEED * (dx/dist);
+      let moveY = ENEMY_SPEED * (dy/dist);
+      tryMove(enemy, moveX, moveY, PLAYER_SIZE);
+      if (Math.abs(enemy.x - nextPx) < 2 && Math.abs(enemy.y - nextPy) < 2) {
+        enemy.path.shift();
+      }
+    } else {
+      enemy.path.shift();
+    }
+  } else {
+    let dx = player.x - enemy.x, dy = player.y - enemy.y;
+    let dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > 10) {
+      dx = ENEMY_SPEED * (dx/dist);
+      dy = ENEMY_SPEED * (dy/dist);
+      tryMove(enemy, dx, dy, PLAYER_SIZE);
+    }
+  }
+  if (enemy.cooldown <= 0 && enemy.overheat === 0) {
+    let dx = player.x - enemy.x, dy = player.y - enemy.y;
+    let absDx = Math.abs(dx), absDy = Math.abs(dy);
+    let direction;
+    if (absDx > absDy) direction = dx < 0 ? 'left' : 'right';
+    else direction = dy < 0 ? 'up' : 'down';
+    if (enemy.fireCount < FIRE_LIMIT) {
+      shootProjectiles(enemy, idx+1, direction, false);
+      enemy.cooldown = 25;
+      enemy.fireCount++;
+      if (enemy.fireCount >= FIRE_LIMIT) {
+        enemy.overheat = OVERHEAT_COOLDOWN;
+      }
+    }
+  }
+  if (enemy.cooldown > 0) enemy.cooldown--;
+}
+
+function updateProjectiles() {
+  // Player projectiles
+  for (let i = projectiles.length-1; i >= 0; i--) {
+    const pr = projectiles[i];
+    pr.x += pr.dx;
+    pr.y += (pr.dy || 0);
+    if (pr.x < -PROJECTILE_SIZE || pr.x > canvas.width || pr.y < -PROJECTILE_SIZE || pr.y > canvas.height) {
+      projectiles.splice(i, 1);
+      continue;
+    }
+    let hitBlock = false;
+    for (const block of blocks) {
+      if (rectsCollide(pr, PROJECTILE_SIZE, PROJECTILE_SIZE, block, BLOCK_SIZE, BLOCK_SIZE)) {
+        projectiles.splice(i, 1);
+        hitBlock = true;
+        break;
+      }
+    }
+    if (hitBlock) continue;
+    // Damage enemies
+    for (let j = 0; j < enemies.length; j++) {
+      const e = enemies[j];
+      if (rectsCollide(pr, PROJECTILE_SIZE, PROJECTILE_SIZE, e, PLAYER_SIZE, PLAYER_SIZE)) {
+        e.health -= pr.damage ?? 1;
+        if (e.health < 0) e.health = 0;
+        projectiles.splice(i, 1);
+        break;
+      }
+    }
+    // Damage Grug boss
+    if (boss && rectsCollide(pr, PROJECTILE_SIZE, PROJECTILE_SIZE, boss, BOSS_SIZE, BOSS_SIZE)) {
+      let dmg = pr.damage ?? 1;
+      if (pr.isShotgun) dmg *= SHOTGUN_BOSS_MULTIPLIER;
+      boss.health -= dmg;
+      if (boss.health < 0) boss.health = 0;
+      projectiles.splice(i, 1);
+      continue;
+    }
+    // Damage Bobby
+    if (bobby && rectsCollide(pr, PROJECTILE_SIZE, PROJECTILE_SIZE, bobby, BOBBY_SIZE, BOBBY_SIZE)) {
+      let dmg = pr.damage ?? 1;
+      bobby.health -= dmg;
+      if (bobby.health < 0) bobby.health = 0;
+      projectiles.splice(i, 1);
+      continue;
+    }
+  }
+  // Enemy projectiles (including Bobby's triangles)
+  for (let i = enemyProjectiles.length-1; i >= 0; i--) {
+    const pr = enemyProjectiles[i];
+    pr.x += pr.dx;
+    pr.y += (pr.dy || 0);
+    if (pr.x < -PROJECTILE_SIZE || pr.x > canvas.width || pr.y < -PROJECTILE_SIZE || pr.y > canvas.height) {
+      enemyProjectiles.splice(i, 1);
+      continue;
+    }
+    let hitBlock = false;
+    for (const block of blocks) {
+      if (rectsCollide(pr, PROJECTILE_SIZE, PROJECTILE_SIZE, block, BLOCK_SIZE, BLOCK_SIZE)) {
+        enemyProjectiles.splice(i, 1);
+        hitBlock = true;
+        break;
+      }
+    }
+    if (hitBlock) continue;
+    if (rectsCollide(pr, PROJECTILE_SIZE, PROJECTILE_SIZE, player, PLAYER_SIZE, PLAYER_SIZE)) {
+      player.health -= pr.damage ?? 1;
+      if (player.health < 0) player.health = 0;
+      enemyProjectiles.splice(i, 1);
+      if (player.health <= 0 && !gameOver) {
+        gameOver = true;
+        winnerText = "YOU DIED!";
+      }
+      continue;
+    }
+  }
+}
+
+function rectsCollide(a, aw, ah, b, bw, bh) {
+  return !(a.x + aw <= b.x || a.x >= b.x + bw || a.y + ah <= b.y || a.y >= b.y + bh);
+}
+
+function drawArrow(x, y, size, direction) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.beginPath();
+  if (direction === 'right') {
+    ctx.moveTo(0, 0);
+    ctx.lineTo(size, size/2);
+    ctx.lineTo(0, size);
+    ctx.closePath();
+  } else if (direction === 'left') {
+    ctx.moveTo(size, 0);
+    ctx.lineTo(0, size/2);
+    ctx.lineTo(size, size);
+    ctx.closePath();
+  } else if (direction === 'up') {
+    ctx.moveTo(0, size);
+    ctx.lineTo(size/2, 0);
+    ctx.lineTo(size, size);
+    ctx.closePath();
+  } else if (direction === 'down') {
+    ctx.moveTo(0, 0);
+    ctx.lineTo(size, 0);
+    ctx.lineTo(size/2, size);
+    ctx.closePath();
+  }
+  ctx.fillStyle = "#ff0";
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawBobbyTriangle(x, y, size, color) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x + size/2, y);                  // Top
+  ctx.lineTo(x + size, y + size);             // Bottom right
+  ctx.lineTo(x, y + size);                    // Bottom left
+  ctx.closePath();
+  ctx.globalAlpha = 0.97;
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = "#ff66ff";
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTriangleProjectile(pr) {
+  ctx.save();
+  let size = PROJECTILE_SIZE + 6;
+  let x = pr.x + PROJECTILE_SIZE/2;
+  let y = pr.y + PROJECTILE_SIZE/2;
+  ctx.translate(x, y);
+  ctx.rotate(pr.triangleAngle ?? 0);
+  ctx.beginPath();
+  ctx.moveTo(0, -size/2);
+  ctx.lineTo(size/2, size/2);
+  ctx.lineTo(-size/2, size/2);
+  ctx.closePath();
+  ctx.globalAlpha = 0.82;
+  ctx.fillStyle = "#ff33d9";
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#ffbbfa";
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBobbyBeams() {
+  if (!bobby || !bobbyBeams.length) return;
+  let centerX = bobby.x + BOBBY_SIZE/2;
+  let centerY = bobby.y + BOBBY_SIZE/2;
+  for (const beam of bobbyBeams) {
+    if (!beam.visible) continue;
+    ctx.save();
+    ctx.globalAlpha = 0.22 + 0.12 * Math.max(0, 10 - beam.frame);
+    ctx.strokeStyle = BOBBY_BEAM_COLOR;
+    ctx.lineWidth = BOBBY_BEAM_WIDTH;
+    ctx.beginPath();
+    ctx.moveTo(centerX, centerY);
+    let bx = centerX + Math.cos(beam.angle) * BOBBY_BEAM_LENGTH;
+    let by = centerY + Math.sin(beam.angle) * BOBBY_BEAM_LENGTH;
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+}
+
+function drawBeamGun() {
+  if (beamGunSpawned && beamGunPos) {
+    ctx.save();
+    ctx.globalAlpha = 0.97;
+    ctx.fillStyle = "#fff700";
+    ctx.strokeStyle = "#c0a800";
+    ctx.lineWidth = 3;
+    // Gun body
+    ctx.fillRect(beamGunPos.x, beamGunPos.y, 32, 14);
+    ctx.strokeRect(beamGunPos.x, beamGunPos.y, 32, 14);
+    // Gun "barrel"
+    ctx.fillStyle = "#fa0";
+    ctx.fillRect(beamGunPos.x + 32, beamGunPos.y + 4, 10, 6);
+    // Glowing beam tip
+    ctx.beginPath();
+    ctx.arc(beamGunPos.x + 43, beamGunPos.y + 7, 4, 0, Math.PI * 2);
+    ctx.fillStyle = "#fffda8";
+    ctx.globalAlpha = 0.8;
+    ctx.fill();
+    ctx.restore();
+
+    // Label
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.font = "bold 18px monospace";
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.fillText("Beam Gun", beamGunPos.x + 22, beamGunPos.y - 4);
+    ctx.restore();
+  }
+}
+function drawBeamGunAttack() {
+  if (!(player.weapon === WEAPON_BEAM && beamGunPicked && bobby && bobby.health > 0)) return;
+  // Draw yellow beam from player to Bobby
+  let px = player.x + PLAYER_SIZE/2;
+  let py = player.y + PLAYER_SIZE/2;
+  let bx = bobby.x + BOBBY_SIZE/2;
+  let by = bobby.y + BOBBY_SIZE/2;
+  let alpha = 0.58 + 0.35 * Math.sin(Date.now()/60);
+  ctx.save();
+  ctx.strokeStyle = "#fff700";
+  ctx.lineWidth = 15;
+  ctx.globalAlpha = beamGunActive ? alpha : 0.18;
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.lineTo(bx, by);
+  ctx.stroke();
+  ctx.restore();
+  // Draw overlay indicator for cooldown
+  if (beamGunCooldown > 0 && !beamGunActive) {
+    let prog = beamGunCooldown / BEAM_GUN_COOLDOWN;
+    ctx.save();
+    ctx.globalAlpha = 0.26;
+    ctx.beginPath();
+    ctx.arc(px, py, 50, 0, Math.PI * 2 * prog, false);
+    ctx.strokeStyle = "#ff9100";
+    ctx.lineWidth = 9;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawGame() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Draw blocks
+  for (const block of blocks) {
+    ctx.fillStyle = "#655";
+    ctx.fillRect(block.x, block.y, BLOCK_SIZE, BLOCK_SIZE);
+    ctx.strokeStyle = "#432";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(block.x, block.y, BLOCK_SIZE, BLOCK_SIZE);
+  }
+
+  // Draw Bobby (triangle boss)
+  if (bobby) {
+    drawBobbyTriangle(bobby.x, bobby.y, BOBBY_SIZE, bobby.color);
+    // Draw Bobby's beams
+    drawBobbyBeams();
+    ctx.save();
+    ctx.font = "bold 32px Arial";
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let bHealthStr = (Math.round(bobby.health * 10) % 10 === 0) ? bobby.health.toString() : bobby.health.toFixed(1);
+    ctx.fillText(bHealthStr, bobby.x + BOBBY_SIZE/2, bobby.y + BOBBY_SIZE/2 - 5);
+    ctx.font = "bold 22px Arial";
+    ctx.fillStyle = "#222";
+    ctx.fillText("BOBBY", bobby.x + BOBBY_SIZE/2, bobby.y + BOBBY_SIZE - 18);
+    ctx.restore();
+  }
+
+  // Draw boss Grug
+  if (boss) {
+    ctx.save();
+    ctx.globalAlpha = 0.96;
+    ctx.fillStyle = boss.color;
+    ctx.fillRect(boss.x, boss.y, BOSS_SIZE, BOSS_SIZE);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 32px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let bHealthStr = (Math.round(boss.health * 10) % 10 === 0) ? boss.health.toString() : boss.health.toFixed(1);
+    ctx.fillText(bHealthStr, boss.x + BOSS_SIZE/2, boss.y + BOSS_SIZE/2 - 12);
+    ctx.font = "bold 22px Arial";
+    ctx.fillStyle = "#222";
+    ctx.fillText("GRUG", boss.x + BOSS_SIZE/2, boss.y + BOSS_SIZE - 18);
+    ctx.restore();
+    ctx.save();
+    ctx.strokeStyle = "#0f0";
+    ctx.lineWidth = 4;
+    ctx.strokeRect(boss.x, boss.y, BOSS_SIZE, BOSS_SIZE);
+    ctx.restore();
+  }
+
+  // Draw beam gun on ground
+  drawBeamGun();
+
+  // Draw player
+  ctx.fillStyle = player.color;
+  ctx.fillRect(player.x, player.y, PLAYER_SIZE, PLAYER_SIZE);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 20px Arial";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  let healthStr = (Math.round(player.health * 10) % 10 === 0) ? player.health.toString() : player.health.toFixed(1);
+  ctx.fillText(healthStr, player.x + PLAYER_SIZE/2, player.y + PLAYER_SIZE/2);
+
+  // Draw facing arrow
+  if (player.facing === 'up') {
+    drawArrow(player.x+PLAYER_SIZE/2-10, player.y-48, 20, player.facing);
+  } else if (player.facing === 'down') {
+    drawArrow(player.x+PLAYER_SIZE/2-10, player.y+PLAYER_SIZE+28, 20, player.facing);
+  } else if (player.facing === 'right') {
+    drawArrow(player.x+PLAYER_SIZE+18, player.y+PLAYER_SIZE/2-10, 20, player.facing);
+  } else if (player.facing === 'left') {
+    drawArrow(player.x-38, player.y+PLAYER_SIZE/2-10, 20, player.facing);
+  }
+
+  // Draw beam gun attack beam
+  drawBeamGunAttack();
+
+  // Overheat indicator for player (not for shotgun or beam)
+  if (player.weapon !== WEAPON_SHOTGUN && player.weapon !== WEAPON_BEAM && player.overheat > 0) {
+    ctx.font = "bold 16px Arial";
+    ctx.fillStyle = "#f00";
+    ctx.fillText("OVERHEAT", player.x + PLAYER_SIZE/2, player.y + PLAYER_SIZE + 18);
+  }
+
+  // Shotgun reload indicator
+  if (player.weapon === WEAPON_SHOTGUN && shotgunNeedsReload) {
+    ctx.font = "bold 16px Arial";
+    ctx.fillStyle = "#fa0";
+    ctx.fillText("RELOADING...", player.x + PLAYER_SIZE/2, player.y + PLAYER_SIZE + 18);
+  }
+
+  // Draw weapon indicator
+  ctx.font = "bold 16px Arial";
+  let weaponName =
+    player.weapon === WEAPON_BEAM ? "Beam Gun" :
+    player.weapon === WEAPON_SHOTGUN ? "Shotgun" :
+    player.weapon === WEAPON_BURST ? "Burst" :
+    "Default";
+  ctx.fillStyle =
+    player.weapon === WEAPON_BEAM ? "#fff700" :
+    player.weapon === WEAPON_SHOTGUN ? "#fa0" :
+    player.weapon === WEAPON_BURST ? "#0fa" : "#fff";
+  ctx.fillText(
+    weaponName,
+    player.x + PLAYER_SIZE/2, player.y - 14
+  );
+  // Beam gun bar (duration)
+  if (player.weapon === WEAPON_BEAM) {
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#fff700";
+    ctx.fillRect(player.x - 2, player.y - 22, 36, 7);
+    let barLen = beamGunActive ? Math.max(0, 36 * (1 - beamGunTimer / BEAM_GUN_DURATION)) : 36;
+    ctx.fillStyle = "#ff9100";
+    ctx.fillRect(player.x - 2, player.y - 22, barLen, 7);
+    ctx.strokeStyle = "#c0a800";
+    ctx.strokeRect(player.x - 2, player.y - 22, 36, 7);
+    ctx.restore();
+    if (beamGunCooldown > 0 && !beamGunActive) {
+      ctx.font = "bold 14px Arial";
+      ctx.fillStyle = "#fa0";
+      ctx.fillText("COOLDOWN", player.x + PLAYER_SIZE/2, player.y + PLAYER_SIZE + 18);
+    }
+  }
+
+  // Draw blocks available
+  ctx.font = "bold 16px Arial";
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "left";
+  ctx.fillText("Blocks Left: " + player.blocksAvailable, 10, 62);
+
+  // Draw enemies
+  for (const e of enemies) {
+    if (e.health <= 0) continue;
+    ctx.fillStyle = e.color;
+    ctx.fillRect(e.x, e.y, PLAYER_SIZE, PLAYER_SIZE);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 20px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(e.health, e.x + PLAYER_SIZE/2, e.y + PLAYER_SIZE/2);
+    ctx.font = "bold 16px Arial";
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("Default", e.x + PLAYER_SIZE/2, e.y - 14);
+    if (e.overheat > 0) {
+      ctx.font = "bold 14px Arial";
+      ctx.fillStyle = "#f00";
+      ctx.fillText("OVERHEAT", e.x + PLAYER_SIZE/2, e.y + PLAYER_SIZE + 12);
+    }
+  }
+
+  // Draw projectiles (player)
+  for (const pr of projectiles) {
+    ctx.fillStyle = "#2ff";
+    ctx.fillRect(pr.x, pr.y, PROJECTILE_SIZE, PROJECTILE_SIZE);
+  }
+  // Draw enemy projectiles (including Bobby's triangles)
+  for (const pr of enemyProjectiles) {
+    if (pr.isTriangle) {
+      drawTriangleProjectile(pr);
+    } else {
+      ctx.fillStyle = "#f22";
+      ctx.fillRect(pr.x, pr.y, PROJECTILE_SIZE, PROJECTILE_SIZE);
+    }
+  }
+
+  // Draw wave number
+  ctx.font = "bold 24px Arial";
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "left";
+  ctx.fillText("Wave: " + wave + "/500", 10, 34);
+
+  // Paused screen for command prompt
+  if (paused && !gameOver) {
+    ctx.save();
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, canvas.height-90, canvas.width, 90);
+    ctx.globalAlpha = 1;
+    ctx.font = "bold 36px monospace";
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.fillText("Paused (Command Prompt Open)", canvas.width/2, canvas.height-55);
+    ctx.font = "20px monospace";
+    ctx.fillText("Type /waveskip [1-500] or /hearts [number] & press Enter", canvas.width/2, canvas.height-30);
+    ctx.restore();
+  }
+
+  // Game over screen
+  if (gameOver) {
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = "#222";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 64px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(winnerText || "GAME OVER", canvas.width/2, canvas.height/2 - 60);
+    ctx.font = "bold 48px Arial";
+    ctx.fillStyle = "#d00";
+    if (!winnerText) ctx.fillText("YOU DIED!", canvas.width/2, canvas.height/2);
+    ctx.font = "bold 32px Arial";
+    ctx.fillStyle = "#fff";
+    ctx.fillText("Press SPACE to replay", canvas.width/2, canvas.height/2 + 60);
+    ctx.restore();
+  }
+  ctx.textAlign = "start";
+  ctx.textBaseline = "alphabetic";
+}
+
+function gameLoop() {
+  if (!paused) {
+    tryPlaceBlock();
+    updateBeamGunPickup();
+    if (!gameOver) {
+      movePlayer();
+      for (let i=0; i<enemies.length; ++i) if (enemies[i].health > 0) moveEnemy(enemies[i], i);
+      if (boss && boss.health > 0) moveBoss();
+      if (bobby && bobby.health > 0) moveBobby();
+      updateBeamGunAttack();
+      updateProjectiles();
+      enemies = enemies.filter(e => e.health > 0);
+      if (
+        (enemies.length === 0) &&
+        (!boss || boss.health <= 0) &&
+        (!bobby || bobby.health <= 0)
+      ) {
+        wave++;
+        unlockWeaponsForWave();
+        spawnEnemies();
+        if (wave <= 500) {
+          player.maxHealth = getMaxHealth(wave);
+          player.health = player.maxHealth;
+          player.blocksAvailable += BLOCKS_PER_WAVE;
+          player.fireCount = 0;
+          player.overheat = 0;
+          shotgunNeedsReload = false;
+          shotgunReloadTimer = 0;
+        }
+      }
+    }
+  }
+  drawGame();
+  requestAnimationFrame(gameLoop);
+}
+
+function resetGame() {
+  resetPlayerAndGameVars();
+  unlockWeaponsForWave();
+  spawnEnemies();
+}
+
+resetGame();
+gameLoop();
+</script>
+</body>
+</html>
